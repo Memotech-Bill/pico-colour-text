@@ -12,6 +12,8 @@
 #include "pico/multicore.h"
 #include "hardware/clocks.h"
 #include "monprom.h"
+#include "bsp/board.h"
+#include "tusb.h"
 #include <stdio.h>
 
 #define ROWS 24
@@ -22,9 +24,17 @@ struct st_char
     uint16_t  fg;
     uint16_t  bg;
     uint8_t  ch;
-    } tbuf[ROWS][COLS];
+    } tbuf[ROWS+1][COLS];
+
+static int iTopRow = 0;
+static uint16_t fg = 0x7FFF;
+static uint16_t bg = 0x0000;
+static int iCsrRow = ROWS - 1;
+static int iCsrCol = COLS - 1;
 
 static uint16_t colours[64];
+
+void hid_task(void);
 
 void __time_critical_func(render_loop) (void)
     {
@@ -36,8 +46,11 @@ void __time_critical_func(render_loop) (void)
         struct scanvideo_scanline_buffer *buffer = scanvideo_begin_scanline_generation (true);
         uint16_t *pix = (uint16_t *) buffer->data;
         int iScan = scanvideo_scanline_number (buffer->scanline_id);
+        bool bEnd = ( iScan == ( ROWS * GLYPH_HEIGHT - 1 ) );
         int iRow = iScan / GLYPH_HEIGHT;
         iScan -= GLYPH_HEIGHT * iRow;
+		iRow += iTopRow;
+        if ( iRow > ROWS ) iRow -= ROWS + 1;
         pix += 1;
         for ( int iCol = 0; iCol < COLS; ++iCol )
             {
@@ -80,18 +93,171 @@ void __time_critical_func(render_loop) (void)
         pix[2] = COLS * GLYPH_WIDTH - 2;
         buffer->data_used = ( COLS * GLYPH_WIDTH + 4 ) / 2;
         scanvideo_end_scanline_generation (buffer);
+        if ( bEnd )
+            {
+            tuh_task();
+            hid_task();
+            }
         }
     }
 
-const scanvideo_mode_t vga_mode_640x240_60 =
+void scroll (void)
+    {
+    int iBotRow = iTopRow - 1;
+    if ( iBotRow < 0 ) iBotRow = ROWS;
+    struct st_char *pch = tbuf[iBotRow];
+    for (int i = 0; i < COLS; ++i)
         {
-                .default_timing = &vga_timing_640x480_60_default,
-                .pio_program = &video_24mhz_composable,
-                .width = 640,
-                .height = 240,
-                .xscale = 1,
-                .yscale = 2,
-        };
+        pch->fg = fg;
+        pch->bg = bg;
+        pch->ch = ' ';
+        ++pch;
+        }
+    if ( ++iTopRow > ROWS ) iTopRow = 0;
+    --iCsrRow;
+    }
+
+void putstr (const char *ps)
+    {
+    int nch = strlen (ps);
+    if ( iCsrCol + nch >= COLS )
+        {
+        iCsrCol = 0;
+        if ( ++iCsrRow >= ROWS ) scroll ();
+        }
+    int iRow = iTopRow + iCsrRow;
+    if ( iRow > ROWS ) iRow -= ROWS + 1;
+    struct st_char *pch = &tbuf[iRow][iCsrCol];
+    iCsrCol += nch;
+    while (nch)
+        {
+        pch->fg = fg;
+        pch->bg = bg;
+        pch->ch = *ps;
+        ++pch;
+        ++ps;
+        --nch;
+        }
+    }
+
+void key_event (uint8_t key, bool bPress)
+    {
+    char sEvent[5];
+    fg = bPress ? colours[12] : colours[3];
+    sprintf (sEvent, "%c%02X ", bPress ? 'P' : 'R', key);
+    putstr (sEvent);
+    }
+
+const scanvideo_mode_t vga_mode_640x240_60 =
+    {
+    .default_timing = &vga_timing_640x480_60_default,
+    .pio_program = &video_24mhz_composable,
+    .width = 640,
+    .height = 240,
+    .xscale = 1,
+    .yscale = 2,
+    };
+
+CFG_TUSB_MEM_SECTION static hid_keyboard_report_t usb_keyboard_report;
+
+// look up new key in previous keys
+static inline int find_key_in_report(hid_keyboard_report_t const *p_report, uint8_t keycode)
+    {
+    for (int i = 0; i < 6; i++)
+        {
+        if (p_report->keycode[i] == keycode) return i;
+        }
+    return -1;
+    }
+
+static inline void process_kbd_report(hid_keyboard_report_t const *p_new_report)
+    {
+    static hid_keyboard_report_t prev_report = {0, 0, {0}}; // previous report to check key released
+    bool held[6];
+    for (int i = 0; i < 6; ++i) held[i] = false;
+    for (int i = 0; i < 6; ++i)
+        {
+        uint8_t key = prev_report.keycode[i];
+        if ( key )
+            {
+            int kr = find_key_in_report(p_new_report, key);
+            if ( kr > 0 )
+                {
+                held[kr] = true;
+                }
+            else
+                {
+                key_event (key, false);
+                }
+            }
+        }
+    int old_mod = prev_report.modifier;
+    int new_mod = p_new_report->modifier;
+    int bit = 0x01;
+    for (int i = 0; i < 8; ++i)
+        {
+        if ((old_mod & bit) && !(new_mod & bit)) key_event (HID_KEY_CONTROL_LEFT + i, false);
+        bit <<= 1;
+        }
+    bit = 0x01;
+    for (int i = 0; i < 8; ++i)
+        {
+        if (!(old_mod & bit) && (new_mod & bit)) key_event (HID_KEY_CONTROL_LEFT + i, true);
+        bit <<= 1;
+        }
+    for (int i = 0; i < 6; ++i)
+        {
+        uint8_t key = p_new_report->keycode[i];
+        if (( ! held[i] ) && ( key ))
+            {
+            key_event (key, true);
+            }
+        }
+
+    prev_report = *p_new_report;
+    }
+
+void hid_task(void)
+	{
+    uint8_t const addr = 1;
+
+    if (tuh_hid_keyboard_is_mounted(addr))
+		{
+        if (!tuh_hid_keyboard_is_busy(addr))
+			{
+            process_kbd_report(&usb_keyboard_report);
+            tuh_hid_keyboard_get_report(addr, &usb_keyboard_report);
+			}
+		}
+	}
+
+void tuh_hid_keyboard_mounted_cb(uint8_t dev_addr)
+    {
+    // application set-up
+#ifdef DEBUG
+    printf("A Keyboard device (address %d) is mounted\r\n", dev_addr);
+#endif
+    tuh_hid_keyboard_get_report(dev_addr, &usb_keyboard_report);
+    fg = colours[63];
+    putstr ("Ins ");
+    }
+
+void tuh_hid_keyboard_unmounted_cb(uint8_t dev_addr)
+    {
+    // application tear-down
+#ifdef DEBUG
+    printf("A Keyboard device (address %d) is unmounted\r\n", dev_addr);
+#endif
+    fg = colours[63];
+    putstr ("Rem ");
+    }
+
+// invoked ISR context
+void tuh_hid_keyboard_isr(uint8_t dev_addr, xfer_result_t event)
+    {
+    (void) dev_addr;
+    (void) event;
+    }
 
 void setup_video (void)
     {
@@ -146,6 +312,7 @@ int main (void)
             ch->bg = colours[iRow & 0x3F];
             }
         }
+    tusb_init();
     setup_video ();
     render_loop ();
     }

@@ -15,3 +15,6 @@ in succession to fill the screen.
 At present the code just displays the contents of tbuf[], which is filled with a demo pattern.
 However the code is only using one core, so it will be possible to use the second core to
 generate or update the text to be displayed.
+
+A simple test of USB keyboard input has now been added.
+
