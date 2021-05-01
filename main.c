@@ -1,7 +1,6 @@
 /*  main.c - The main program
 
-    WJB  2/ 4/21 Attempting to develop a version of MEMU on an RPi Pico
-                 As a first step attempt to reproduce Propeller video
+Demonstration of 80x24 text buffer and minimal keyboard handling.
 
 */
 
@@ -14,6 +13,7 @@
 #include "monprom.h"
 #include "bsp/board.h"
 #include "tusb.h"
+#include "class/hid/hid.h"
 #include <stdio.h>
 
 #define ROWS 24
@@ -27,8 +27,6 @@ struct st_char
     } tbuf[ROWS+1][COLS];
 
 static int iTopRow = 0;
-static uint16_t fg = 0x7FFF;
-static uint16_t bg = 0x0000;
 static int iCsrRow = ROWS - 1;
 static int iCsrCol = COLS - 1;
 
@@ -93,15 +91,17 @@ void __time_critical_func(render_loop) (void)
         pix[2] = COLS * GLYPH_WIDTH - 2;
         buffer->data_used = ( COLS * GLYPH_WIDTH + 4 ) / 2;
         scanvideo_end_scanline_generation (buffer);
+        /*
         if ( bEnd )
             {
             tuh_task();
             hid_task();
             }
+        */
         }
     }
 
-void scroll (void)
+void scroll (uint16_t fg, uint16_t bg)
     {
     int iBotRow = iTopRow - 1;
     if ( iBotRow < 0 ) iBotRow = ROWS;
@@ -117,13 +117,13 @@ void scroll (void)
     --iCsrRow;
     }
 
-void putstr (const char *ps)
+void putstr (const char *ps, uint16_t fg, uint16_t bg)
     {
     int nch = strlen (ps);
     if ( iCsrCol + nch >= COLS )
         {
         iCsrCol = 0;
-        if ( ++iCsrRow >= ROWS ) scroll ();
+        if ( ++iCsrRow >= ROWS ) scroll (fg, bg);
         }
     int iRow = iTopRow + iCsrRow;
     if ( iRow > ROWS ) iRow -= ROWS + 1;
@@ -140,12 +140,52 @@ void putstr (const char *ps)
         }
     }
 
+static uint8_t led_flags = 0;
+
+void set_leds (uint8_t leds)
+    {
+    uint8_t const addr = 1;
+    led_flags = leds;
+
+    tusb_control_request_t ledreq = {
+        .bmRequestType_bit.recipient = TUSB_REQ_RCPT_INTERFACE,
+        .bmRequestType_bit.type = TUSB_REQ_TYPE_CLASS,
+        .bmRequestType_bit.direction = TUSB_DIR_OUT,
+        .bRequest = HID_REQ_CONTROL_SET_REPORT,
+        .wValue = HID_REPORT_TYPE_OUTPUT << 8,
+        .wIndex = 0,    // Interface number
+        .wLength = sizeof (led_flags)
+        };
+    
+    bool bRes = tuh_control_xfer (addr, &ledreq, &led_flags, NULL);
+    }
+
 void key_event (uint8_t key, bool bPress)
     {
+    uint8_t leds = led_flags;
     char sEvent[5];
-    fg = bPress ? colours[12] : colours[3];
     sprintf (sEvent, "%c%02X ", bPress ? 'P' : 'R', key);
-    putstr (sEvent);
+    putstr (sEvent, bPress ? colours[12] : colours[3], colours[0]);
+    if ( bPress )
+        {
+        switch (key)
+            {
+            case HID_KEY_NUM_LOCK:
+                leds ^= KEYBOARD_LED_NUMLOCK;
+                set_leds (leds);
+                break;
+            case HID_KEY_CAPS_LOCK:
+                leds ^= KEYBOARD_LED_CAPSLOCK;
+                set_leds (leds);
+                break;
+            case HID_KEY_SCROLL_LOCK:
+                leds ^= KEYBOARD_LED_SCROLLLOCK;
+                set_leds (leds);
+                break;
+            default:
+                break;
+            }
+        }
     }
 
 const scanvideo_mode_t vga_mode_640x240_60 =
@@ -181,7 +221,7 @@ static inline void process_kbd_report(hid_keyboard_report_t const *p_new_report)
         if ( key )
             {
             int kr = find_key_in_report(p_new_report, key);
-            if ( kr > 0 )
+            if ( kr >= 0 )
                 {
                 held[kr] = true;
                 }
@@ -238,8 +278,7 @@ void tuh_hid_keyboard_mounted_cb(uint8_t dev_addr)
     printf("A Keyboard device (address %d) is mounted\r\n", dev_addr);
 #endif
     tuh_hid_keyboard_get_report(dev_addr, &usb_keyboard_report);
-    fg = colours[63];
-    putstr ("Ins ");
+    putstr ("Ins ", colours[63], colours[0]);
     }
 
 void tuh_hid_keyboard_unmounted_cb(uint8_t dev_addr)
@@ -248,8 +287,7 @@ void tuh_hid_keyboard_unmounted_cb(uint8_t dev_addr)
 #ifdef DEBUG
     printf("A Keyboard device (address %d) is unmounted\r\n", dev_addr);
 #endif
-    fg = colours[63];
-    putstr ("Rem ");
+    putstr ("Rem ", colours[63], colours[0]);
     }
 
 // invoked ISR context
@@ -257,6 +295,16 @@ void tuh_hid_keyboard_isr(uint8_t dev_addr, xfer_result_t event)
     {
     (void) dev_addr;
     (void) event;
+    }
+
+void keyboard_loop (void)
+    {
+    tusb_init();
+    while ( true )
+        {
+        tuh_task();
+        hid_task();
+        }
     }
 
 void setup_video (void)
@@ -288,7 +336,7 @@ int main (void)
         printf ("%d seconds to start\n", i);
         }
 #endif
-    // set_sys_clock_khz (200000, true);
+    set_sys_clock_khz (150000, true);
     printf ("Building screen.\n");
     int i = 0;
     for ( int b = 0; b <= 0xFF; b += 0x55 )
@@ -312,7 +360,8 @@ int main (void)
             ch->bg = colours[iRow & 0x3F];
             }
         }
-    tusb_init();
+    // tusb_init();
+    multicore_launch_core1 (keyboard_loop);
     setup_video ();
     render_loop ();
     }
