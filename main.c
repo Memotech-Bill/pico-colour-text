@@ -18,6 +18,8 @@ Demonstration of 80x24 text buffer and minimal keyboard handling.
 
 #define ROWS 24
 #define COLS 80
+#define VID_CORE    1
+// #define DEBUG
 
 struct st_char
     {
@@ -44,7 +46,7 @@ void __time_critical_func(render_loop) (void)
         struct scanvideo_scanline_buffer *buffer = scanvideo_begin_scanline_generation (true);
         uint16_t *pix = (uint16_t *) buffer->data;
         int iScan = scanvideo_scanline_number (buffer->scanline_id);
-        bool bEnd = ( iScan == ( ROWS * GLYPH_HEIGHT - 1 ) );
+        // bool bEnd = ( iScan == ( ROWS * GLYPH_HEIGHT - 1 ) );
         int iRow = iScan / GLYPH_HEIGHT;
         iScan -= GLYPH_HEIGHT * iRow;
 		iRow += iTopRow;
@@ -157,14 +159,17 @@ void set_leds (uint8_t leds)
         .wLength = sizeof (led_flags)
         };
     
-    bool bRes = tuh_control_xfer (addr, &ledreq, &led_flags, NULL);
+    tuh_control_xfer (addr, &ledreq, &led_flags, NULL);
     }
 
 void key_event (uint8_t key, bool bPress)
     {
     uint8_t leds = led_flags;
     char sEvent[5];
-    sprintf (sEvent, "%c%02X ", bPress ? 'P' : 'R', key);
+#ifdef DEBUG
+    printf ("%s key 0x%02X\n", bPress ? "Press" : "Release", key);
+#endif
+    sprintf (sEvent, "%c%02hhX ", bPress ? 'P' : 'R', key);
     putstr (sEvent, bPress ? colours[12] : colours[3], colours[0]);
     if ( bPress )
         {
@@ -197,8 +202,6 @@ const scanvideo_mode_t vga_mode_640x240_60 =
     .xscale = 1,
     .yscale = 2,
     };
-
-CFG_TUSB_MEM_SECTION static hid_keyboard_report_t usb_keyboard_report;
 
 // look up new key in previous keys
 static inline int find_key_in_report(hid_keyboard_report_t const *p_report, uint8_t keycode)
@@ -257,6 +260,10 @@ static inline void process_kbd_report(hid_keyboard_report_t const *p_new_report)
     prev_report = *p_new_report;
     }
 
+#if PICO_SDK_VERSION_MAJOR == 1
+#if PICO_SDK_VERSION_MINOR < 2
+CFG_TUSB_MEM_SECTION static hid_keyboard_report_t usb_keyboard_report;
+
 void hid_task(void)
 	{
     uint8_t const addr = 1;
@@ -297,6 +304,118 @@ void tuh_hid_keyboard_isr(uint8_t dev_addr, xfer_result_t event)
     (void) event;
     }
 
+#else   // PICO_SDK_VERSION_MINOR >= 2
+void hid_task (void)
+    {
+    }
+
+// Each HID instance can has multiple reports
+
+#define MAX_REPORT  4
+static uint8_t kbd_addr;
+static uint8_t _report_count;
+static tuh_hid_report_info_t _report_info_arr[MAX_REPORT];
+
+//--------------------------------------------------------------------+
+// TinyUSB Callbacks
+//--------------------------------------------------------------------+
+
+// Invoked when device with hid interface is mounted
+// Report descriptor is also available for use. tuh_hid_parse_report_descriptor()
+// can be used to parse common/simple enough descriptor.
+void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_report, uint16_t desc_len)
+    {
+    // Interface protocol
+    uint8_t const interface_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+    if ( interface_protocol == HID_ITF_PROTOCOL_KEYBOARD )
+        {
+        kbd_addr = dev_addr;
+#ifdef DEBUG
+        printf ("Keyboard mounted: dev_addr = %d\n", dev_addr);
+#endif
+    
+        _report_count = tuh_hid_parse_report_descriptor(_report_info_arr, MAX_REPORT,
+            desc_report, desc_len);
+#ifdef DEBUG
+        printf ("%d reports defined\n", _report_count);
+#endif
+        putstr ("Ins ", colours[63], colours[0]);
+        }
+    }
+
+// Invoked when device with hid interface is un-mounted
+void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t __attribute__((unused)) instance)
+    {
+#ifdef DEBUG
+    printf ("Device %d unmounted\n");
+#endif
+    if ( dev_addr == kbd_addr )
+        {
+        kbd_addr = 0;
+        putstr ("Rem ", colours[63], colours[0]);
+        }
+    }
+
+// Invoked when received report from device via interrupt endpoint
+void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t __attribute__((unused)) instance,
+    uint8_t const* report, uint16_t len)
+    {
+    if ( dev_addr != kbd_addr ) return;
+
+    uint8_t const rpt_count = _report_count;
+    tuh_hid_report_info_t* rpt_info_arr = _report_info_arr;
+    tuh_hid_report_info_t* rpt_info = NULL;
+
+    if ( rpt_count == 1 && rpt_info_arr[0].report_id == 0)
+        {
+        // Simple report without report ID as 1st byte
+        rpt_info = &rpt_info_arr[0];
+        }
+    else
+        {
+        // Composite report, 1st byte is report ID, data starts from 2nd byte
+        uint8_t const rpt_id = report[0];
+
+        // Find report id in the arrray
+        for(uint8_t i=0; i<rpt_count; i++)
+            {
+            if (rpt_id == rpt_info_arr[i].report_id )
+                {
+                rpt_info = &rpt_info_arr[i];
+                break;
+                }
+            }
+
+        report++;
+        len--;
+        }
+
+    if (!rpt_info)
+        {
+#ifdef DEBUG
+        printf("Couldn't find the report info for this report !\r\n");
+#endif
+        return;
+        }
+
+    if ( rpt_info->usage_page == HID_USAGE_PAGE_DESKTOP )
+        {
+        switch (rpt_info->usage)
+            {
+            case HID_USAGE_DESKTOP_KEYBOARD:
+                // Assume keyboard follow boot report layout
+                process_kbd_report( (hid_keyboard_report_t const*) report );
+                break;
+
+            default:
+                break;
+            }
+        }
+    }
+
+#endif  // PICO_SDK_VERSION_MINOR
+#endif  // PICO_SDK_VERSION_MAJOR
+
 void keyboard_loop (void)
     {
     tusb_init();
@@ -318,10 +437,12 @@ void setup_video (void)
 #ifdef DEBUG
     printf ("System clock speed %d kHz\n", clock_get_hz (clk_sys) / 1000);
 #endif
+    render_loop ();
     }
 
 int main (void)
     {
+    set_sys_clock_khz (150000, true);
 #ifdef DEBUG
     const uint LED_PIN = PICO_DEFAULT_LED_PIN;
     stdio_init_all();
@@ -335,9 +456,8 @@ int main (void)
         sleep_ms(500);
         printf ("%d seconds to start\n", i);
         }
-#endif
-    set_sys_clock_khz (150000, true);
     printf ("Building screen.\n");
+#endif
     int i = 0;
     for ( int b = 0; b <= 0xFF; b += 0x55 )
         {
@@ -361,7 +481,11 @@ int main (void)
             }
         }
     // tusb_init();
+#if VID_CORE == 0
     multicore_launch_core1 (keyboard_loop);
     setup_video ();
-    render_loop ();
+#else // VID_CORE == 1
+    multicore_launch_core1 (setup_video);
+    keyboard_loop ();
+#endif
     }
